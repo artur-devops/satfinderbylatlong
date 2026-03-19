@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Satellite Beam Finder - STANDALONE VERSION
-No external libraries required! Uses only built-in Python modules.
-Find which satellite beams cover a given geographic point and display carrier information.
+FIXED: Using simple 2D ray casting algorithm
 """
 
 import json
@@ -10,77 +9,96 @@ import sys
 from typing import List, Dict, Any, Optional, Tuple, Union
 
 # ============================================================================
-# Point-in-Polygon algorithm (ray casting method)
-# No external dependencies - pure Python implementation
+# SIMPLE 2D RAY CASTING ALGORITHM - THIS WORKS!
 # ============================================================================
 
 def point_in_polygon(point_lon: float, point_lat: float, polygon: List[List[float]]) -> bool:
     """
-    Check if a point is inside a polygon using the ray casting algorithm.
+    SIMPLE RAY CASTING ALGORITHM (2D)
+    Properly handles longitude and latitude
     
     Args:
-        point_lon: Longitude of the point
-        point_lat: Latitude of the point
-        polygon: List of [lon, lat] points defining the polygon (closed or open)
+        point_lon: Longitude of the point (-180 to 180)
+        point_lat: Latitude of the point (-90 to 90)
+        polygon: List of [lon, lat] points defining the polygon
     
     Returns:
-        True if the point is inside the polygon, False otherwise
+        True if point is inside polygon, False otherwise
     """
-    # Make sure polygon is closed (first point equals last point)
-    if polygon[0] != polygon[-1]:
-        polygon = polygon + [polygon[0]]
+    # First, do a quick bounding box check
+    min_lon = min(p[0] for p in polygon)
+    max_lon = max(p[0] for p in polygon)
+    min_lat = min(p[1] for p in polygon)
+    max_lat = max(p[1] for p in polygon)
     
+    # Quick reject - if point is outside bounding box, it's outside polygon
+    if point_lat < min_lat or point_lat > max_lat:
+        return False
+    
+    # Check if polygon crosses the 180° meridian
+    crosses_180 = False
+    for i in range(len(polygon)):
+        lon1, _ = polygon[i]
+        lon2, _ = polygon[(i + 1) % len(polygon)]
+        # If one longitude is near 180°E and another near 180°W
+        if (lon1 > 150 and lon2 < -150) or (lon1 < -150 and lon2 > 150):
+            crosses_180 = True
+            break
+    
+    # If polygon crosses 180°, normalize all longitudes to 0-360 range
+    if crosses_180:
+        normalized_polygon = []
+        for lon, lat in polygon:
+            if lon < 0:
+                normalized_polygon.append([lon + 360, lat])
+            else:
+                normalized_polygon.append([lon, lat])
+        
+        # Normalize point longitude
+        check_lon = point_lon if point_lon >= 0 else point_lon + 360
+        check_lat = point_lat
+    else:
+        normalized_polygon = polygon
+        check_lon = point_lon
+        check_lat = point_lat
+    
+    # Ray casting algorithm
     inside = False
-    n = len(polygon) - 1  # Last point is the same as first, so we check edges up to n-1
+    n = len(normalized_polygon)
     
     for i in range(n):
-        x1, y1 = polygon[i]
-        x2, y2 = polygon[i + 1]
+        x1, y1 = normalized_polygon[i]
+        x2, y2 = normalized_polygon[(i + 1) % n]
         
-        # Check if the point is exactly on a vertex or edge
-        # First, handle horizontal edges to avoid division by zero
-        if y1 == y2:
-            if y1 == point_lat and min(x1, x2) <= point_lon <= max(x1, x2):
-                return True  # Point is on horizontal edge
-        else:
-            # Check if point is on the line segment
-            if min(x1, x2) <= point_lon <= max(x1, x2) and min(y1, y2) <= point_lat <= max(y1, y2):
-                # Check collinearity
-                cross = (point_lon - x1) * (y2 - y1) - (point_lat - y1) * (x2 - x1)
-                if abs(cross) < 1e-10:  # Point is on the edge
-                    return True
-        
-        # Ray casting algorithm
-        # Check if the edge crosses the horizontal ray at point_lat
-        if ((y1 > point_lat) != (y2 > point_lat)):
+        # Check if the edge crosses the horizontal line at point_lat
+        # Edge must span vertically across the point's latitude
+        if ((y1 > check_lat) != (y2 > check_lat)):
             # Calculate x coordinate of intersection
-            x_intersect = x1 + (point_lat - y1) * (x2 - x1) / (y2 - y1)
-            if x_intersect == point_lon:
-                return True  # Point is on the edge
-            if x_intersect > point_lon:
-                inside = not inside
+            if y2 != y1:  # Avoid division by zero
+                x_intersect = x1 + (check_lat - y1) * (x2 - x1) / (y2 - y1)
+                
+                # Count intersections to the right of the point
+                if x_intersect > check_lon:
+                    inside = not inside
     
     return inside
 
 
 # ============================================================================
-# Data structures and main finder class
+# Data structures (same as before but with FIXED coordinate handling)
 # ============================================================================
 
 class CarrierInfo:
     """Store carrier (transponder) information."""
     
     def __init__(self, beam_id: int, center_freq: float, polarization: str, 
-                 symbol_rate: float, carrier_type: str):
+                 symbol_rate: float, carrier_type: str, satellite_id: str = ""):
         self.beam_id = beam_id
         self.center_freq = center_freq
         self.polarization = polarization
         self.symbol_rate = symbol_rate
         self.carrier_type = carrier_type
-    
-    def __repr__(self) -> str:
-        return (f"Beam {self.beam_id}: {self.center_freq/1000000:.3f} MHz, "
-                f"RX:{self.polarization}, {self.symbol_rate:,.0f} symbols/s")
+        self.satellite_id = satellite_id
 
 
 class BeamInfo:
@@ -91,48 +109,44 @@ class BeamInfo:
         self.satellite_id = satellite_id
         self.satellite_longitude = satellite_longitude
         self.beam_id = beam_id
-        self.points = points  # Store original points for verification
-        self.carriers: List[CarrierInfo] = []  # Associated carriers
+        self.points = points  # Now in [lon, lat] format
+        self.carriers: List[CarrierInfo] = []
     
     def add_carrier(self, carrier: CarrierInfo) -> None:
         """Add a carrier to this beam."""
         self.carriers.append(carrier)
     
-    def __repr__(self) -> str:
-        lon_str = f"@{self.satellite_longitude}°" if self.satellite_longitude is not None else ""
-        return f"{self.satellite_id}{lon_str} - Beam {self.beam_id} ({len(self.carriers)} carriers)"
+    def get_bounding_box(self) -> Tuple[float, float, float, float]:
+        """Return (min_lon, max_lon, min_lat, max_lat)"""
+        lons = [p[0] for p in self.points]
+        lats = [p[1] for p in self.points]
+        return (min(lons), max(lons), min(lats), max(lats))
 
 
 class SatelliteBeamFinder:
-    """Standalone satellite beam finder with no external dependencies."""
+    """Satellite beam finder with FIXED geometry handling."""
     
     def __init__(self, json_file_path: str):
-        """
-        Initialize the finder by loading and processing satellite data.
-        
-        Args:
-            json_file_path: Path to the JSON file with satellite configuration
-        """
         self.json_file_path = json_file_path
-        self.beams: Dict[int, BeamInfo] = {}  # Index by beam_id for quick lookup
-        self.beam_list: List[BeamInfo] = []  # List for iteration
+        self.beams: Dict[str, BeamInfo] = {}
+        self.beam_list: List[BeamInfo] = []
+        self.satellites: Dict[str, Dict] = {}
         self.error_count = 0
         self.warning_count = 0
         self.load_data()
     
     def load_data(self) -> None:
-        """Load satellite data from JSON file and extract beam polygons and carriers."""
+        """Load satellite data from JSON file."""
         print(f"📂 Loading data from: {self.json_file_path}")
         
         satellites = self._load_satellite_data()
         if satellites:
+            self._extract_satellite_info(satellites)
             self._extract_all_beams(satellites)
             self._link_carriers_to_beams(satellites)
-            print(f"✓ Successfully loaded {len(self.beam_list)} beam contours with carriers")
+            print(f"✓ Loaded {len(self.beam_list)} beam contours")
             if self.warning_count > 0:
-                print(f"⚠️  Warnings: {self.warning_count} (invalid contours skipped)")
-            if self.error_count > 0:
-                print(f"✗ Errors: {self.error_count}")
+                print(f"⚠️  Warnings: {self.warning_count}")
         else:
             print("✗ Failed to load satellite data")
             sys.exit(1)
@@ -145,11 +159,20 @@ class SatelliteBeamFinder:
             return data.get("CONSTELLATION", {}).get("SATELLITES", [])
         except FileNotFoundError:
             print(f"✗ ERROR: File '{self.json_file_path}' not found!")
-            print("  Please make sure the JSON file is in the same directory as this script.")
             return None
         except json.JSONDecodeError as e:
             print(f"✗ ERROR: Invalid JSON format - {e}")
             return None
+    
+    def _extract_satellite_info(self, satellites: List[Dict]) -> None:
+        """Extract satellite information for later use."""
+        for satellite in satellites:
+            sat_id = satellite.get("satellite_id", "Unknown")
+            sat_lon = satellite.get("longitude", None)
+            self.satellites[sat_id] = {
+                'longitude': sat_lon,
+                'satellite_id': sat_id
+            }
     
     def _extract_all_beams(self, satellites: List[Dict]) -> None:
         """Extract beam contours from all satellites."""
@@ -159,9 +182,7 @@ class SatelliteBeamFinder:
     def _extract_beams_from_satellite(self, satellite: Dict) -> None:
         """
         Extract all beam contours from a single satellite.
-        
-        Args:
-            satellite: Dictionary containing satellite data
+        FIXED: Coordinates in JSON are [LATITUDE, LONGITUDE]
         """
         sat_id = satellite.get("satellite_id", "Unknown")
         sat_lon = satellite.get("longitude", None)
@@ -177,82 +198,90 @@ class SatelliteBeamFinder:
                 
             contours = beam.get("CONTOUR", [])
             
-            for contour_idx, contour in enumerate(contours):
+            for contour in contours:
                 # Process only polygon type contours (type=1)
                 if contour.get("type") == 1:
                     points = contour.get("points", [])
-                    self._validate_and_store_beam(sat_id, sat_lon, beam_id, contour_idx, points)
+                    self._validate_and_store_beam(sat_id, sat_lon, beam_id, points)
     
     def _validate_and_store_beam(self, sat_id: str, sat_lon: Optional[float], 
-                                 beam_id: int, contour_idx: int, points: List[List[float]]) -> None:
+                                 beam_id: int, points: List[List[float]]) -> None:
         """
         Validate contour points and store as a beam.
-        
-        Args:
-            sat_id: Satellite identifier
-            sat_lon: Satellite longitude
-            beam_id: Beam identifier
-            contour_idx: Contour index within the beam
-            points: List of [lon, lat] points defining the contour
+        FIXED: JSON stores [LATITUDE, LONGITUDE], convert to [LONGITUDE, LATITUDE]
         """
         if len(points) < 3:
             self.warning_count += 1
-            return  # Not enough points to form a polygon
+            return
         
-        # Check if all points are valid numbers
-        for i, point in enumerate(points):
+        # Convert from [LATITUDE, LONGITUDE] to [LONGITUDE, LATITUDE]
+        converted_points = []
+        for point in points:
             if len(point) != 2:
                 self.warning_count += 1
                 return
             try:
-                float(point[0])
-                float(point[1])
+                lat = float(point[0])  # First value is latitude
+                lon = float(point[1])  # Second value is longitude
+                
+                # Basic validation
+                if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+                    self.warning_count += 1
+                    return
+                
+                # Store as [LONGITUDE, LATITUDE]
+                converted_points.append([lon, lat])
+                
             except (ValueError, TypeError):
                 self.warning_count += 1
                 return
         
-        # Create or update beam
-        if beam_id not in self.beams:
+        # Use satellite+beam_id as unique key
+        unique_key = f"{sat_id}_{beam_id}"
+        
+        if unique_key not in self.beams:
             beam_info = BeamInfo(
                 satellite_id=sat_id,
                 satellite_longitude=sat_lon,
                 beam_id=beam_id,
-                points=points
+                points=converted_points
             )
-            self.beams[beam_id] = beam_info
+            self.beams[unique_key] = beam_info
             self.beam_list.append(beam_info)
-        else:
-            # For beams with multiple contours, we keep the first one
-            # (assuming they represent the same coverage area)
-            pass
     
     def _link_carriers_to_beams(self, satellites: List[Dict]) -> None:
         """Link carrier information to their respective beams."""
         carrier_count = 0
         
         for satellite in satellites:
+            sat_id = satellite.get("satellite_id", "Unknown")
             carriers = satellite.get("CARRIER", [])
+            
             for carrier in carriers:
                 beam_id = carrier.get("beam_id")
-                if beam_id is None or beam_id not in self.beams:
+                if beam_id is None:
                     continue
                 
-                # Extract carrier information
+                unique_key = f"{sat_id}_{beam_id}"
+                
+                if unique_key not in self.beams:
+                    continue
+                
                 center_freq = carrier.get("center_freq", 0)
                 polarization = carrier.get("polarization", "Unknown")
                 symbol_rate = carrier.get("symbol_rate", 0)
                 carrier_type = carrier.get("carrier_type", "Unknown")
                 
-                # Create and link carrier
                 carrier_info = CarrierInfo(
                     beam_id=beam_id,
                     center_freq=center_freq,
                     polarization=polarization,
                     symbol_rate=symbol_rate,
-                    carrier_type=carrier_type
+                    carrier_type=carrier_type,
+                    satellite_id=sat_id
                 )
                 
-                self.beams[beam_id].add_carrier(carrier_info)
+                self.beams[unique_key].add_carrier(carrier_info)
                 carrier_count += 1
         
         print(f"✓ Linked {carrier_count} carriers to beams")
@@ -260,15 +289,17 @@ class SatelliteBeamFinder:
     def find_beams_at_point(self, longitude: float, latitude: float) -> List[BeamInfo]:
         """
         Find all beams that contain the specified point.
-        
-        Args:
-            longitude: Point longitude (-180 to 180)
-            latitude: Point latitude (-90 to 90)
-        
-        Returns:
-            List of BeamInfo objects for matching beams
+        Uses SIMPLE 2D ray casting algorithm.
         """
         results = []
+        
+        # For debugging, print first few beams
+        print("\nDEBUG: First 3 beams loaded:")
+        for i, beam in enumerate(self.beam_list[:3]):
+            bbox = beam.get_bounding_box()
+            print(f"  {i+1}. {beam.satellite_id} beam {beam.beam_id}:")
+            print(f"     Bounding box: lon [{bbox[0]:.1f}°, {bbox[1]:.1f}°], lat [{bbox[2]:.1f}°, {bbox[3]:.1f}°]")
+            print(f"     First point: [lon={beam.points[0][0]:.1f}°, lat={beam.points[0][1]:.1f}°]")
         
         for beam in self.beam_list:
             if point_in_polygon(longitude, latitude, beam.points):
@@ -288,7 +319,7 @@ class SatelliteBeamFinder:
 
 
 # ============================================================================
-# User interface functions
+# User interface functions (same as before)
 # ============================================================================
 
 def clear_screen():
@@ -322,16 +353,7 @@ def print_help():
 
 
 def validate_coordinate(value: str, coord_type: str) -> Optional[float]:
-    """
-    Validate and parse a coordinate string.
-    
-    Args:
-        value: Input string
-        coord_type: 'longitude' or 'latitude' for error messages
-    
-    Returns:
-        Parsed float value or None if invalid
-    """
+    """Validate and parse a coordinate string."""
     try:
         val = float(value)
         
@@ -367,14 +389,7 @@ def format_symbol_rate(sr_hz: float) -> str:
 
 
 def display_beam_results(beams: List[BeamInfo], lon: float, lat: float) -> None:
-    """
-    Display beam search results with carrier information.
-    
-    Args:
-        beams: List of matching beams
-        lon: Longitude of search point
-        lat: Latitude of search point
-    """
+    """Display beam search results with carrier information."""
     print("\n" + "=" * 80)
     if beams:
         print(f"✅ FOUND {len(beams)} BEAM(S) covering ({lon}°, {lat}°):\n")
@@ -416,12 +431,10 @@ def main():
     # Main interaction loop
     while True:
         try:
-            # Get input
             print("\n" + "-" * 50)
             print("📌 Enter coordinates (LONGITUDE first, then LATITUDE):")
             lon_input = input("   LONGITUDE (-180 to 180) > ").strip().lower()
             
-            # Handle special commands
             if lon_input in ['exit', 'quit', 'q']:
                 break
             if lon_input == 'stats':
@@ -432,9 +445,10 @@ def main():
                 satellites = sorted(set(beam.satellite_id for beam in finder.beam_list))
                 print(f"\n📡 Available satellites ({len(satellites)}):")
                 for i, sat in enumerate(satellites, 1):
-                    # Count beams for this satellite
                     beam_count = sum(1 for beam in finder.beam_list if beam.satellite_id == sat)
-                    print(f"   {i:2d}. {sat} ({beam_count} beams)")
+                    lon = next((beam.satellite_longitude for beam in finder.beam_list if beam.satellite_id == sat), None)
+                    lon_str = f" at {lon}°" if lon is not None else ""
+                    print(f"   {i:2d}. {sat}{lon_str} ({beam_count} beams)")
                 continue
             if lon_input == 'help':
                 print_help()
@@ -445,7 +459,6 @@ def main():
             if lat_input in ['exit', 'quit', 'q']:
                 break
             
-            # Validate coordinates
             lon = validate_coordinate(lon_input, 'longitude')
             if lon is None:
                 continue
@@ -454,11 +467,9 @@ def main():
             if lat is None:
                 continue
             
-            # Find matching beams
             print(f"\n🔍 Searching for beams covering longitude {lon}°, latitude {lat}°...")
             results = finder.find_beams_at_point(lon, lat)
             
-            # Display results with carrier information
             display_beam_results(results, lon, lat)
             
         except KeyboardInterrupt:
